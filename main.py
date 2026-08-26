@@ -20,7 +20,7 @@ from telethon.tl.functions.photos import UploadProfilePhotoRequest, DeletePhotos
 from telethon.tl.types import InputPhoto
 
 # ==================== КОНФИГ ====================
-BOT_TOKEN = "8642683935:AAHFlaXgroXtlxNyEtZUhmJgSJ2Vq_0vyRk"
+BOT_TOKEN = "8642683935:AAGJ8jfdru4MU-YX3bAacJgKDOltyfo5rWo"
 ADMIN_ID = 7545129896
 DEFAULT_PASSWORD = "tbl_kto66666677"
 
@@ -100,6 +100,10 @@ class AuthMiddleware(BaseMiddleware):
         if isinstance(event, types.Message):
             # Пропускаем /start и /panel без проверки
             if event.text and (event.text.startswith('/start') or event.text.startswith('/panel')):
+                return await handler(event, data)
+            
+            # Проверяем состояние FSM - если пользователь вводит пароль - пропускаем
+            if data.get('state') and await data['state'].get_state() == PasswordStates.waiting_password.state:
                 return await handler(event, data)
             
             user_id = event.from_user.id
