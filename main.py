@@ -18,6 +18,7 @@ from telethon.sessions import StringSession
 from telethon.tl.functions.account import UpdateProfileRequest
 from telethon.tl.functions.photos import UploadProfilePhotoRequest, DeletePhotosRequest, GetUserPhotosRequest
 from telethon.tl.types import InputPhoto
+from telethon.errors import SessionPasswordNeededError
 
 # ==================== КОНФИГ ====================
 BOT_TOKEN = "8642683935:AAHFlaXgroXtlxNyEtZUhmJgSJ2Vq_0vyRk"
@@ -90,27 +91,23 @@ async def init_db():
     conn.commit()
     conn.close()
 
-# ==================== МИДЛВАРЬ (ПОЛНОСТЬЮ ПРОПУСКАЕТ ВСЕ FSM СОСТОЯНИЯ) ====================
+# ==================== МИДЛВАРЬ ====================
 class AuthMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
-        # Все callback'и пропускаем
         if isinstance(event, types.CallbackQuery):
             return await handler(event, data)
-        
         if isinstance(event, types.Message):
-            # Пропускаем команды /start и /panel
             if event.text and (event.text.startswith('/start') or event.text.startswith('/panel')):
                 return await handler(event, data)
-            
-            # Проверяем, есть ли активное состояние FSM
             if data.get('state'):
                 current_state = await data['state'].get_state()
-                # Список всех состояний, которые пропускаем
                 allowed_states = [
                     PasswordStates.waiting_password.state,
                     ConnectStates.waiting_api_id.state,
                     ConnectStates.waiting_api_hash.state,
-                    ConnectStates.waiting_qr.state,
+                    ConnectStates.waiting_phone.state,
+                    ConnectStates.waiting_code.state,
+                    ConnectStates.waiting_2fa.state,
                     TicketState.waiting_message.state,
                     AdminCreatePass.waiting_new_pass.state,
                     AdminDeletePass.waiting_pass_id.state,
@@ -120,8 +117,6 @@ class AuthMiddleware(BaseMiddleware):
                 ]
                 if current_state in allowed_states:
                     return await handler(event, data)
-            
-            # Проверка активности пользователя
             user_id = event.from_user.id
             conn = get_conn()
             c = conn.cursor()
@@ -133,7 +128,6 @@ class AuthMiddleware(BaseMiddleware):
             else:
                 await event.answer("❌ Нет доступа. Введите пароль через /start.")
                 return
-        
         return await handler(event, data)
 
 # ==================== СОСТОЯНИЯ FSM ====================
@@ -143,7 +137,9 @@ class PasswordStates(StatesGroup):
 class ConnectStates(StatesGroup):
     waiting_api_id = State()
     waiting_api_hash = State()
-    waiting_qr = State()
+    waiting_phone = State()
+    waiting_code = State()
+    waiting_2fa = State()
 
 class TicketState(StatesGroup):
     waiting_message = State()
@@ -180,19 +176,7 @@ async def show_main_menu(message: types.Message):
     await message.answer("🏠 Главное меню:", reply_markup=keyboard)
 
 async def is_account_connected(user_id: int) -> bool:
-    """Проверяет, подключён ли аккаунт пользователя."""
     return user_id in user_clients and user_clients[user_id].is_connected()
-
-async def require_account(func):
-    """Декоратор для проверки подключения аккаунта."""
-    async def wrapper(callback: types.CallbackQuery, *args, **kwargs):
-        user_id = callback.from_user.id
-        if not await is_account_connected(user_id):
-            await callback.message.edit_text("❌ Сначала подключите аккаунт в главном меню.")
-            await callback.answer()
-            return
-        return await func(callback, *args, **kwargs)
-    return wrapper
 
 # ==================== /start ====================
 @dp.message(Command("start"))
@@ -247,7 +231,6 @@ async def process_password(message: types.Message, state: FSMContext):
     conn = get_conn()
     c = conn.cursor()
     
-    # Проверяем, не активен ли уже пользователь
     c.execute("SELECT is_active FROM users WHERE user_id = ?", (user_id,))
     active_row = c.fetchone()
     if active_row and active_row[0] == 1:
@@ -257,11 +240,9 @@ async def process_password(message: types.Message, state: FSMContext):
         await show_main_menu(message)
         return
     
-    # Ищем неиспользованный пароль
     c.execute("SELECT id, password, used_by FROM passwords WHERE password = ? AND used = 0", (entered,))
     row = c.fetchone()
     if row:
-        # Пароль верный и не использован
         c.execute("UPDATE passwords SET used = 1, used_by = ? WHERE id = ?", (user_id, row[0]))
         c.execute("UPDATE users SET is_active = 1 WHERE user_id = ?", (user_id,))
         conn.commit()
@@ -270,12 +251,10 @@ async def process_password(message: types.Message, state: FSMContext):
         await message.answer("✅ Доступ получен! Теперь вы можете пользоваться автоответчиком.")
         await show_main_menu(message)
     else:
-        # Проверяем, не использован ли этот пароль этим же пользователем
         c.execute("SELECT used_by FROM passwords WHERE password = ?", (entered,))
         used_row = c.fetchone()
         conn.close()
         if used_row and used_row[0] == user_id:
-            # Пароль уже использован этим пользователем, но вдруг is_active сброшен - восстанавливаем
             conn2 = get_conn()
             c2 = conn2.cursor()
             c2.execute("UPDATE users SET is_active = 1 WHERE user_id = ?", (user_id,))
@@ -299,14 +278,12 @@ async def logout(callback: types.CallbackQuery):
     c.execute("UPDATE users SET is_active = 0 WHERE user_id = ?", (user_id,))
     conn.commit()
     conn.close()
-    # Отключаем клиента, если есть
     if user_id in user_clients:
         await user_clients[user_id].disconnect()
         del user_clients[user_id]
     await callback.message.edit_text("✅ Вы вышли из системы. Для входа используйте /start.")
     await callback.answer()
-
-# ==================== ПОДКЛЮЧЕНИЕ АККАУНТА ====================
+    # ==================== ПОДКЛЮЧЕНИЕ АККАУНТА (SMS) ====================
 @dp.callback_query(F.data == "connect_account")
 async def start_connect(callback: types.CallbackQuery, state: FSMContext):
     user_id = callback.from_user.id
@@ -316,15 +293,15 @@ async def start_connect(callback: types.CallbackQuery, state: FSMContext):
     row = c.fetchone()
     conn.close()
     if row and row[0] and row[1]:
-        api_id = int(row[0])
-        api_hash = row[1]
-        await state.update_data(api_id=api_id, api_hash=api_hash)
-        await generate_qr(callback.message, state)
+        await state.update_data(api_id=int(row[0]), api_hash=row[1])
+        await state.set_state(ConnectStates.waiting_phone)
+        await callback.message.edit_text("📱 Введите номер телефона в международном формате (например +79001234567):")
+        await callback.answer()
         return
 
     await state.set_state(ConnectStates.waiting_api_id)
     await callback.message.edit_text(
-        "📱 Для подключения аккаунта нужны API_ID и API_HASH.\n"
+        "Для подключения аккаунта нужны API_ID и API_HASH.\n"
         "Получить их можно на my.telegram.org/apps\n\n"
         "Введите ваш API_ID (число):"
     )
@@ -356,31 +333,66 @@ async def process_api_hash(message: types.Message, state: FSMContext):
               (str(data['api_id']), data['api_hash'], user_id))
     conn.commit()
     conn.close()
-    await generate_qr(message, state)
+    await state.set_state(ConnectStates.waiting_phone)
+    await message.answer("📱 Введите номер телефона в международном формате (например +79001234567):")
 
-async def generate_qr(message, state):
+@dp.message(ConnectStates.waiting_phone)
+async def process_phone(message: types.Message, state: FSMContext):
+    phone = message.text.strip()
+    if not phone.startswith('+'):
+        await message.answer("❌ Номер должен начинаться с + и кода страны (например +79001234567).")
+        return
+    await state.update_data(phone=phone)
     data = await state.get_data()
     api_id = data['api_id']
     api_hash = data['api_hash']
     client = TelegramClient(StringSession(), api_id, api_hash)
     await client.connect()
-    if await client.is_user_authorized():
-        await finalize_connection(message, client, state)
-        return
-    qr = await client.qr_login()
-    await state.update_data(client=client, qr=qr)
-    qr_url = qr.url
-    await message.answer(
-        f"📱 Отсканируйте QR-код через Telegram:\n{qr_url}\n\n"
-        "Или на телефоне: Настройки → Устройства → Подключить устройство\n"
-        "После сканирования бот автоматически подключит аккаунт.\n\n"
-        "Напишите /cancel, чтобы отменить."
-    )
+    try:
+        if await client.is_user_authorized():
+            await finalize_connection(message, client, state)
+            return
+        await client.send_code_request(phone)
+        await state.update_data(client=client)
+        await state.set_state(ConnectStates.waiting_code)
+        await message.answer("📨 Код подтверждения отправлен в Telegram. Введите его:")
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: {e}\nПроверьте номер и попробуйте снова.")
+        await state.set_state(ConnectStates.waiting_phone)
 
-@dp.message(Command("cancel"))
-async def cancel_connect(message: types.Message, state: FSMContext):
-    await state.clear()
-    await show_main_menu(message)
+@dp.message(ConnectStates.waiting_code)
+async def process_code(message: types.Message, state: FSMContext):
+    code = message.text.strip()
+    data = await state.get_data()
+    client = data.get('client')
+    phone = data.get('phone')
+    if not client:
+        await message.answer("❌ Ошибка сессии. Начните заново /start")
+        return
+    try:
+        await client.sign_in(phone, code)
+        await finalize_connection(message, client, state)
+    except SessionPasswordNeededError:
+        await state.set_state(ConnectStates.waiting_2fa)
+        await message.answer("🔐 Требуется двухфакторная аутентификация. Введите пароль 2FA:")
+    except Exception as e:
+        await message.answer(f"❌ Неверный код или ошибка: {e}\nПопробуйте снова.")
+        await state.set_state(ConnectStates.waiting_code)
+
+@dp.message(ConnectStates.waiting_2fa)
+async def process_2fa(message: types.Message, state: FSMContext):
+    password = message.text.strip()
+    data = await state.get_data()
+    client = data.get('client')
+    if not client:
+        await message.answer("❌ Ошибка сессии. Начните заново /start")
+        return
+    try:
+        await client.sign_in(password=password)
+        await finalize_connection(message, client, state)
+    except Exception as e:
+        await message.answer(f"❌ Неверный пароль 2FA: {e}\nПопробуйте снова.")
+        await state.set_state(ConnectStates.waiting_2fa)
 
 async def finalize_connection(message, client, state):
     session_str = client.session.save()
@@ -388,12 +400,13 @@ async def finalize_connection(message, client, state):
     conn = get_conn()
     c = conn.cursor()
     c.execute("REPLACE INTO sessions (user_id, session_string, phone) VALUES (?, ?, ?)",
-              (user_id, session_str, "qr"))
+              (user_id, session_str, "sms"))
     conn.commit()
     conn.close()
     user_clients[user_id] = client
     await state.clear()
     await message.answer("✅ Аккаунт успешно подключён! Теперь автоответчик активен.")
+    asyncio.create_task(start_listener(user_id))
     await show_main_menu(message)
 
 # ==================== АВТООТВЕТЧИК ====================
@@ -421,7 +434,7 @@ async def start_listener(user_id):
                 try:
                     await event.reply(row[1] if row[1] else "Автоответ: я сейчас занят, отвечу позже.")
                 except Exception as e:
-                    logging.error(f"Auto reply error for {user_id}: {e}")
+                    logging.error(f"Auto reply error: {e}")
     if not client.is_connected():
         await client.connect()
 
@@ -447,8 +460,9 @@ async def load_all_clients():
                     user_clients[user_id] = client
                     asyncio.create_task(start_listener(user_id))
             except Exception as e:
-                logging.error(f"Failed to load session for {user_id}: {e}")
-                # ==================== НАСТРОЙКИ АВТООТВЕТА ====================
+                logging.error(f"Failed to load session: {e}")
+
+# ==================== НАСТРОЙКИ АВТООТВЕТА ====================
 @dp.callback_query(F.data == "autoreply_settings")
 async def settings_menu(callback: types.CallbackQuery):
     if not await is_account_connected(callback.from_user.id):
@@ -676,7 +690,6 @@ async def process_ticket(message: types.Message, state: FSMContext):
     conn.close()
     await state.clear()
     await message.answer("✅ Ваше обращение отправлено. Ожидайте ответа.")
-    # Уведомление админу
     await bot.send_message(ADMIN_ID, f"🆘 Новый тикет от @{user.username or user.id}:\n{text[:200]}")
 
 @dp.callback_query(F.data == "back_main")
@@ -724,96 +737,4 @@ async def panel_actions(callback: types.CallbackQuery, state: FSMContext):
         open_tickets = c.fetchone()[0]
         text = f"📊 Статистика:\n👥 Всего пользователей: {total_users}\n✅ Активных: {active_users}\n🔑 Паролей: {total_passes}\n🎫 Открытых тикетов: {open_tickets}"
         await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="◀️ Назад", callback_data="panel_back")]
-        ]))
-    elif data == "panel_users":
-        c.execute("SELECT user_id, username, first_name, registered_at, is_active FROM users")
-        users = c.fetchall()
-        text = "👥 Пользователи:\n" + "\n".join(
-            f"{u[0]} | @{u[1] or ''} | {u[2]} | рег: {u[3]} | активен: {u[4]}" for u in users)
-        await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="◀️ Назад", callback_data="panel_back")]
-        ]))
-    elif data == "panel_passwords":
-        c.execute("SELECT id, password, used, used_by FROM passwords")
-        passes = c.fetchall()
-        text = "🔑 Пароли:\n" + "\n".join(
-            f"{p[0]}: {p[1]} | использован: {p[2]} | кем: {p[3] or '—'}" for p in passes)
-        await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="◀️ Назад", callback_data="panel_back")]
-        ]))
-    elif data == "panel_tickets":
-        c.execute("SELECT id, user_id, username, message, status, created_at FROM tickets ORDER BY created_at DESC")
-        tickets = c.fetchall()
-        text = "🎫 Тикеты:\n" + "\n".join(
-            f"#{t[0]} от {t[1]} (@{t[2] or ''}) | {t[4]}: {t[3][:50]}..." for t in tickets)
-        await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="◀️ Назад", callback_data="panel_back")]
-        ]))
-    elif data == "panel_create_pass":
-        await state.set_state(AdminCreatePass.waiting_new_pass)
-        await callback.message.edit_text("Введите новый пароль (только латиница, цифры, _):", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="◀️ Отмена", callback_data="panel_back")]
-        ]))
-    elif data == "panel_delete_pass":
-        await state.set_state(AdminDeletePass.waiting_pass_id)
-        await callback.message.edit_text("Введите ID пароля для удаления (из списка выше):", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="◀️ Отмена", callback_data="panel_back")]
-        ]))
-    conn.close()
-    await callback.answer()
-
-@dp.message(AdminCreatePass.waiting_new_pass)
-async def create_new_pass(message: types.Message, state: FSMContext):
-    new_pass = message.text.strip()
-    if not new_pass:
-        await message.answer("Пароль не может быть пустым.")
-        return
-    conn = get_conn()
-    c = conn.cursor()
-    try:
-        c.execute("INSERT INTO passwords (password, created_by, used) VALUES (?, ?, 0)",
-                  (new_pass, ADMIN_ID))
-        conn.commit()
-        await message.answer(f"✅ Пароль '{new_pass}' создан.")
-    except sqlite3.IntegrityError:
-        await message.answer("❌ Такой пароль уже существует.")
-    conn.close()
-    await state.clear()
-    await show_main_menu(message)
-
-@dp.message(AdminDeletePass.waiting_pass_id)
-async def delete_pass(message: types.Message, state: FSMContext):
-    try:
-        pass_id = int(message.text.strip())
-    except ValueError:
-        await message.answer("❌ Введите число (ID пароля).")
-        return
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT password FROM passwords WHERE id = ?", (pass_id,))
-    row = c.fetchone()
-    if not row:
-        await message.answer("❌ Пароль с таким ID не найден.")
-        conn.close()
-        return
-    if row[0] == DEFAULT_PASSWORD:
-        await message.answer("❌ Нельзя удалить пароль по умолчанию.")
-        conn.close()
-        return
-    c.execute("DELETE FROM passwords WHERE id = ?", (pass_id,))
-    conn.commit()
-    conn.close()
-    await message.answer(f"✅ Пароль с ID {pass_id} удалён.")
-    await state.clear()
-    await show_main_menu(message)
-
-# ==================== ЗАПУСК ====================
-async def main():
-    await init_db()
-    await load_all_clients()
-    await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
-
-if __name__ == "__main__":
-    asyncio.run(main())
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="pa
