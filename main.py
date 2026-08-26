@@ -20,7 +20,7 @@ from telethon.tl.functions.photos import UploadProfilePhotoRequest, DeletePhotos
 from telethon.tl.types import InputPhoto
 
 # ==================== КОНФИГ ====================
-BOT_TOKEN = "8642683935:AAHFlaXgroXtlxNyEtZUhmJgSJ2Vq_0vyRk"
+BOT_TOKEN = "8642683935:AAGJ8jfdru4MU-YX3bAacJgKDOltyfo5rWo"
 ADMIN_ID = 7545129896
 DEFAULT_PASSWORD = "tbl_kto66666677"
 
@@ -89,11 +89,17 @@ async def init_db():
     conn.commit()
     conn.close()
 
-# ==================== МИДЛВАРЬ ====================
+# ==================== МИДЛВАРЬ (ИСПРАВЛЕНА) ====================
 class AuthMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
-        if event.text and (event.text.startswith('/start') or event.text.startswith('/panel')):
+        # Проверяем, является ли событие сообщением
+        if isinstance(event, types.Message):
+            if event.text and (event.text.startswith('/start') or event.text.startswith('/panel')):
+                return await handler(event, data)
+        # Для callback_query пропускаем проверку
+        if isinstance(event, types.CallbackQuery):
             return await handler(event, data)
+        
         user_id = event.from_user.id
         conn = get_conn()
         c = conn.cursor()
@@ -305,7 +311,7 @@ async def delete_pass(message: types.Message, state: FSMContext):
     conn.close()
     await message.answer(f"✅ Пароль с ID {pass_id} удалён.")
     await state.clear()
-# ==================== ПОДКЛЮЧЕНИЕ АККАУНТА ====================
+    # ==================== ПОДКЛЮЧЕНИЕ АККАУНТА ====================
 @dp.callback_query(F.data == "connect_account")
 async def start_connect(callback: types.CallbackQuery, state: FSMContext):
     user_id = callback.from_user.id
