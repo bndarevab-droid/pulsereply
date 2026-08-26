@@ -20,7 +20,7 @@ from telethon.tl.functions.photos import UploadProfilePhotoRequest, DeletePhotos
 from telethon.tl.types import InputPhoto
 
 # ==================== КОНФИГ ====================
-BOT_TOKEN = "8642683935:AAGJ8jfdru4MU-YX3bAacJgKDOltyfo5rWo"
+BOT_TOKEN = "8642683935:AAHFlaXgroXtlxNyEtZUhmJgSJ2Vq_0vyRk"
 ADMIN_ID = 7545129896
 DEFAULT_PASSWORD = "tbl_kto66666677"
 
