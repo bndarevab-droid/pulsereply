@@ -92,25 +92,30 @@ async def init_db():
 # ==================== МИДЛВАРЬ (ИСПРАВЛЕНА) ====================
 class AuthMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
-        # Проверяем, является ли событие сообщением
-        if isinstance(event, types.Message):
-            if event.text and (event.text.startswith('/start') or event.text.startswith('/panel')):
-                return await handler(event, data)
-        # Для callback_query пропускаем проверку
+        # Если это callback_query - пропускаем всегда (кнопки)
         if isinstance(event, types.CallbackQuery):
             return await handler(event, data)
         
-        user_id = event.from_user.id
-        conn = get_conn()
-        c = conn.cursor()
-        c.execute("SELECT is_active FROM users WHERE user_id = ?", (user_id,))
-        row = c.fetchone()
-        conn.close()
-        if row and row[0] == 1:
-            return await handler(event, data)
-        else:
-            await event.answer("❌ Нет доступа. Купите подписку или введите пароль через /start.")
-            return
+        # Если это сообщение - проверяем
+        if isinstance(event, types.Message):
+            # Пропускаем /start и /panel без проверки
+            if event.text and (event.text.startswith('/start') or event.text.startswith('/panel')):
+                return await handler(event, data)
+            
+            user_id = event.from_user.id
+            conn = get_conn()
+            c = conn.cursor()
+            c.execute("SELECT is_active FROM users WHERE user_id = ?", (user_id,))
+            row = c.fetchone()
+            conn.close()
+            if row and row[0] == 1:
+                return await handler(event, data)
+            else:
+                await event.answer("❌ Нет доступа. Купите подписку или введите пароль через /start.")
+                return
+        
+        # Если что-то другое - пропускаем
+        return await handler(event, data)
 
 # ==================== СОСТОЯНИЯ FSM ====================
 class PasswordStates(StatesGroup):
